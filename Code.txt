@@ -1,0 +1,652 @@
+#include <SPI.h>
+#include <SD.h>
+#include <FS.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <driver/i2s.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 22, 21);
+
+// ---------- ขา ----------
+const int BTN_FWD = 13, BTN_BACK = 14, BTN_LEFT = 16, BTN_RIGHT = 17, BTN_FIRE = 32;
+#define SD_CS 5
+const int PIN_BCLK = 26, PIN_LRC = 25, PIN_DIN = 27;
+
+#define SW 128
+#define SH 64
+
+inline bool pressed(int p) { return digitalRead(p) == LOW; }
+
+// ================= เสียง =================
+const int SR = 15000;                 // ตรงกับเสียงใน bad.dat
+const int CHUNK = 128;
+const float MUSVOL = 0.22f;           // ความดังเพลง
+const float SFXVOL = 0.35f;           // ความดังเสียงเอฟเฟกต์
+const int   BA_VOLUME = 64;           // ความดัง Bad Apple (1-256)
+
+enum { SND_SHOT, SND_HIT, SND_DIE, SND_HURT, SND_WIN, SND_LOSE, NSND };
+const float vsec[NSND] = {0.25f, 0.12f, 0.5f, 0.18f, 0.5f, 0.8f};
+volatile bool trig[NSND];
+bool vact[NSND];
+uint32_t vpos[NSND];
+
+volatile bool audioPaused = false;
+volatile int musicCmd = 0;            // 1 = เริ่มเพลง, 2 = หยุดเพลง
+volatile int musicMode = 0;           // 0 = ปิด, 1 = เพลงในโค้ด, 2 = ไฟล์ doom.raw
+SemaphoreHandle_t audioMux;
+bool sdOk = false;
+File musicFile;
+
+void playSound(int t) { trig[t] = true; }
+
+static uint32_t rngState = 12345;
+static inline float frand() {
+  rngState ^= rngState << 13; rngState ^= rngState >> 17; rngState ^= rngState << 5;
+  return (rngState & 0xFFFF) / 32768.0f - 1.0f;
+}
+
+float voiceSample(int t, uint32_t n) {
+  float tt = (float)n / SR;
+  float life = 1.0f - tt / vsec[t];
+  if (life < 0) life = 0;
+  switch (t) {
+    case SND_SHOT:
+      return 0.8f * frand() * expf(-tt * 22.0f) + 0.6f * sinf(2 * PI * 70.0f * tt) * expf(-tt * 20.0f);
+    case SND_HIT:
+      return (((int)(tt * 440.0f) & 1) ? 0.5f : -0.5f) * life;
+    case SND_DIE: {
+      float ph = 380.0f * tt - 300.0f * tt * tt;
+      return (2.0f * (ph - floorf(ph)) - 1.0f) * 0.6f * life;
+    }
+    case SND_HURT:
+      return (((int)(tt * 220.0f) & 1) ? 0.6f : -0.6f) * life;
+    case SND_WIN: {
+      static const float notes[4] = {523.0f, 659.0f, 784.0f, 1047.0f};
+      int idx = (int)(tt / 0.125f); if (idx > 3) idx = 3;
+      return sinf(2 * PI * notes[idx] * tt) * 0.5f * life;
+    }
+    case SND_LOSE: {
+      static const float notes[4] = {392.0f, 330.0f, 262.0f, 196.0f};
+      int idx = (int)(tt / 0.2f); if (idx > 3) idx = 3;
+      return sinf(2 * PI * notes[idx] * tt) * 0.5f * life;
+    }
+  }
+  return 0;
+}
+
+// ---- เพลงที่แต่งเอง: เมทัลจังหวะหนัก 64 สเต็ป สเต็ปละ 0.1 วินาที วนซ้ำ ----
+// ค่าเบสเป็นครึ่งเสียงเหนือโน้ต A1 (55 Hz), -1 = เงียบ
+const int8_t BASS[64] = {
+  0,-1,0,0, -1,0,0,-1, 0,-1,0,0, 3,-1,5,-1,
+  0,-1,0,0, -1,0,0,-1, 0,-1,0,0, 6,-1,5,-1,
+  8,-1,8,8, -1,8,8,-1, 7,-1,7,7, -1,7,7,-1,
+  5,-1,5,5, -1,5,5,-1, 3,-1,3,3, 1,-1,0,-1
+};
+// เสียงลีด 1 โน้ตต่อ 4 สเต็ป ครึ่งเสียงเหนือ A3 (220 Hz)
+const int8_t LEAD16[16] = {-1,-1,-1,-1,-1,-1,-1,-1, 12,15,17,15,19,17,15,12};
+
+static uint32_t mpos = 0;
+static float bph = 0, lph = 0, hpPrev = 0;
+static int lastStep = -1;
+static float bassF = 0, leadF = 0;
+
+float synthMusic() {
+  const uint32_t stepLen = SR / 10;
+  int step = (mpos / stepLen) % 64;
+  uint32_t inStep = mpos % stepLen;
+  float t = (float)inStep / SR;
+  mpos++;
+  if (step != lastStep) {
+    lastStep = step;
+    bassF = BASS[step] >= 0 ? 55.0f * powf(2.0f, BASS[step] / 12.0f) : 0;
+    int ln = LEAD16[step >> 2];
+    leadF = ln >= 0 ? 220.0f * powf(2.0f, ln / 12.0f) : 0;
+  }
+  float out = 0;
+  if (bassF > 0) {                                  // เบสดิสทอร์ชัน ตัดสั้นให้ได้จังหวะกระชาก
+    bph += bassF / SR; if (bph >= 1) bph -= 1;
+    float d = (2 * bph - 1) * 3.0f;
+    if (d > 1) d = 1; if (d < -1) d = -1;
+    out += d * 0.55f * expf(-t * 12.0f);
+  }
+  if (leadF > 0) {                                  // ลีดสี่เหลี่ยม
+    lph += leadF / SR; if (lph >= 1) lph -= 1;
+    float tn = ((step & 3) * stepLen + inStep) / (float)SR;
+    out += (lph < 0.5f ? 1.0f : -1.0f) * 0.16f * expf(-tn * 3.5f);
+  }
+  int pos = step & 15;
+  bool kick = (pos == 0 || pos == 6 || pos == 10);
+  bool snare = (pos == 4 || pos == 12);
+  bool hat = ((pos & 1) == 0) && !snare;
+  if (kick) {
+    float ph = 45.0f * t + 70.0f * (1.0f - expf(-30.0f * t)) / 30.0f;
+    out += sinf(2 * PI * ph) * 0.9f * expf(-t * 14.0f);
+  }
+  if (snare) out += frand() * 0.5f * expf(-t * 22.0f) + sinf(2 * PI * 190.0f * t) * 0.3f * expf(-t * 30.0f);
+  if (hat) { float n = frand(); out += (n - hpPrev) * 0.15f * expf(-t * 70.0f); hpPrev = n; }
+  return out;
+}
+
+void audioTask(void *) {
+  int16_t buf[CHUNK * 2];
+  uint8_t mbuf[CHUNK];
+  size_t w;
+  while (true) {
+    if (audioPaused) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+    xSemaphoreTake(audioMux, portMAX_DELAY);
+
+    if (musicCmd == 1) {
+      musicCmd = 0;
+      if (musicMode == 2) musicFile.close();
+      mpos = 0; lastStep = -1;
+      musicMode = 1;
+      if (sdOk && SD.exists("/doom.raw")) {
+        musicFile = SD.open("/doom.raw");
+        if (musicFile) musicMode = 2;
+      }
+    } else if (musicCmd == 2) {
+      musicCmd = 0;
+      if (musicMode == 2) musicFile.close();
+      musicMode = 0;
+    }
+
+    if (musicMode == 2) {
+      int got = musicFile.read(mbuf, CHUNK);
+      if (got < 0) got = 0;
+      if (got < CHUNK) {                           // จบไฟล์ วนกลับต้นเพลง
+        musicFile.seek(0);
+        for (int k = got; k < CHUNK; k++) mbuf[k] = 128;
+      }
+    }
+
+    for (int i = 0; i < CHUNK; i++) {
+      float s = 0;
+      if (musicMode == 1) s += synthMusic() * MUSVOL;
+      else if (musicMode == 2) s += (((float)mbuf[i] - 128.0f) / 128.0f) * MUSVOL * 1.5f;
+      for (int t = 0; t < NSND; t++) {
+        if (!vact[t]) continue;
+        s += voiceSample(t, vpos[t]) * SFXVOL;
+        if (++vpos[t] >= (uint32_t)(vsec[t] * SR)) vact[t] = false;
+      }
+      if (s > 1.0f) s = 1.0f;
+      if (s < -1.0f) s = -1.0f;
+      int16_t v = (int16_t)(s * 32767.0f);
+      buf[2 * i] = v;
+      buf[2 * i + 1] = v;
+    }
+    for (int t = 0; t < NSND; t++)
+      if (trig[t]) { trig[t] = false; vpos[t] = 0; vact[t] = true; }
+
+    i2s_write(I2S_NUM_0, buf, sizeof(buf), &w, portMAX_DELAY);
+    xSemaphoreGive(audioMux);
+  }
+}
+
+void setupAudio() {
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  cfg.sample_rate = SR;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 6;
+  cfg.dma_buf_len = 128;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = true;
+  i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
+
+  i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;
+  pins.bck_io_num = PIN_BCLK;
+  pins.ws_io_num = PIN_LRC;
+  pins.data_out_num = PIN_DIN;
+  pins.data_in_num = I2S_PIN_NO_CHANGE;
+  i2s_set_pin(I2S_NUM_0, &pins);
+
+  audioMux = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 0);
+}
+
+void stopMusic() {
+  musicCmd = 2;
+  uint32_t t0 = millis();
+  while (musicMode != 0 && millis() - t0 < 300) delay(2);
+}
+
+// ================= ตัวช่วยจอ/ปุ่ม =================
+void drawCentered(const char* s, int y) {
+  int w = u8g2.getStrWidth(s);
+  u8g2.drawStr((SW - w) / 2, y, s);
+}
+
+void waitRelease() {
+  uint32_t t0 = millis();
+  while ((pressed(BTN_FWD) || pressed(BTN_BACK) || pressed(BTN_LEFT) ||
+          pressed(BTN_RIGHT) || pressed(BTN_FIRE)) && millis() - t0 < 1500) delay(10);
+  delay(40);
+}
+
+void showMsg(const char* a, const char* b) {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.drawFrame(4, 16, 120, 32);
+  u8g2.setFont(u8g2_font_6x12_tr);
+  drawCentered(a, 32);
+  u8g2.setFont(u8g2_font_5x7_tr);
+  drawCentered(b, 43);
+  u8g2.sendBuffer();
+  delay(1800);
+}
+
+// ================= Bad Apple =================
+const int BA_AUDIO = SR / 15;                 // 1000 ตัวอย่างต่อเฟรม (15 fps)
+uint8_t  baAud[BA_AUDIO];
+int16_t  baOut[BA_AUDIO * 2];
+
+void runBadApple() {
+  if (!sdOk) { showMsg("NO SD CARD", "check the SD module"); return; }
+  File f = SD.open("/bad.dat");
+  if (!f) { showMsg("bad.dat missing", "copy it to the SD root"); return; }
+
+  stopMusic();
+  waitRelease();
+  audioPaused = true;
+  xSemaphoreTake(audioMux, portMAX_DELAY);
+
+  uint8_t *buf = u8g2.getBufferPtr();
+  size_t written;
+  while (f.read(buf, 1024) == 1024 && f.read(baAud, BA_AUDIO) == BA_AUDIO) {
+    for (int i = 0; i < BA_AUDIO; i++) {
+      int16_t s = ((int)baAud[i] - 128) * BA_VOLUME;
+      baOut[2 * i] = s;
+      baOut[2 * i + 1] = s;
+    }
+    i2s_write(I2S_NUM_0, baOut, sizeof(baOut), &written, portMAX_DELAY);
+    u8g2.sendBuffer();
+    if (pressed(BTN_FIRE) || pressed(BTN_BACK)) break;   // ออกกลางคัน
+  }
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  f.close();
+  xSemaphoreGive(audioMux);
+  audioPaused = false;
+  waitRelease();
+}
+
+// ================= DOOM =================
+#define MAPW 16
+#define MAPH 16
+#define NEN 5
+
+const char* MAPDATA[MAPH] = {
+  "################",
+  "#..............#",
+  "#..###....###..#",
+  "#..#........#..#",
+  "#..#........#..#",
+  "#..............#",
+  "#....######....#",
+  "#....#....#....#",
+  "#....#....#....#",
+  "#....######....#",
+  "#..............#",
+  "#..#........#..#",
+  "#..#........#..#",
+  "#..###....###..#",
+  "#..............#",
+  "################"
+};
+
+struct Enemy { float x, y; int hp; };
+Enemy en[NEN];
+
+float posX, posY, dirX, dirY, planeX, planeY;
+float zbuf[SW];
+int hp, kills;
+float fireCd, hurtCd;
+int flash, hurtFlash;
+uint32_t lastMs;
+enum State { PLAY, DEAD, WON };
+State state = PLAY;
+
+bool isWall(int x, int y) {
+  if (x < 0 || y < 0 || x >= MAPW || y >= MAPH) return true;
+  return MAPDATA[y][x] == '#';
+}
+
+void moveEntity(float &x, float &y, float dx, float dy, float r) {
+  float nx = x + dx;
+  if (!isWall((int)(nx + (dx > 0 ? r : -r)), (int)y)) x = nx;
+  float ny = y + dy;
+  if (!isWall((int)x, (int)(ny + (dy > 0 ? r : -r)))) y = ny;
+}
+
+void resetGame() {
+  posX = 1.5f; posY = 1.5f;
+  dirX = 1; dirY = 0; planeX = 0; planeY = -0.66f;
+  hp = 100; kills = 0; fireCd = 0; hurtCd = 0; flash = 0; hurtFlash = 0;
+  const float ex[NEN] = {13.5f, 13.5f, 1.5f, 7.5f, 8.5f};
+  const float ey[NEN] = {1.5f, 14.5f, 14.5f, 5.5f, 10.5f};
+  for (int i = 0; i < NEN; i++) { en[i].x = ex[i]; en[i].y = ey[i]; en[i].hp = 2; }
+  state = PLAY;
+  musicCmd = 1;                      // เริ่มเพลง
+}
+
+void rotateView(float a) {          // a เป็นบวก = เลี้ยวซ้าย
+  float c = cosf(a), s = sinf(a);
+  float ox = dirX;   dirX = dirX * c - dirY * s;     dirY = ox * s + dirY * c;
+  float op = planeX; planeX = planeX * c - planeY * s; planeY = op * s + planeY * c;
+}
+
+void castWalls() {
+  for (int x = 0; x < SW; x++) {
+    float camX = 2.0f * x / SW - 1.0f;
+    float rdx = dirX + planeX * camX;
+    float rdy = dirY + planeY * camX;
+    int mx = (int)posX, my = (int)posY;
+    float ddx = (rdx == 0) ? 1e30f : fabsf(1.0f / rdx);
+    float ddy = (rdy == 0) ? 1e30f : fabsf(1.0f / rdy);
+    int stepX, stepY; float sdx, sdy;
+    if (rdx < 0) { stepX = -1; sdx = (posX - mx) * ddx; } else { stepX = 1; sdx = (mx + 1.0f - posX) * ddx; }
+    if (rdy < 0) { stepY = -1; sdy = (posY - my) * ddy; } else { stepY = 1; sdy = (my + 1.0f - posY) * ddy; }
+    int side = 0;
+    while (true) {
+      if (sdx < sdy) { sdx += ddx; mx += stepX; side = 0; }
+      else           { sdy += ddy; my += stepY; side = 1; }
+      if (isWall(mx, my)) break;
+    }
+    float dist = (side == 0) ? (sdx - ddx) : (sdy - ddy);
+    if (dist < 0.05f) dist = 0.05f;
+    zbuf[x] = dist;
+
+    int lh = (int)(SH / dist);
+    int y0 = SH / 2 - lh / 2, y1 = SH / 2 + lh / 2;
+    if (y0 < 0) y0 = 0;
+    if (y1 > SH - 1) y1 = SH - 1;
+
+    int shade = dist < 2.0f ? 3 : dist < 4.0f ? 2 : dist < 7.0f ? 1 : 0;
+    if (side) shade--;
+    if (shade >= 3) {
+      u8g2.drawVLine(x, y0, y1 - y0 + 1);
+    } else {
+      u8g2.drawPixel(x, y0); u8g2.drawPixel(x, y1);
+      if (shade == 2) {
+        for (int y = y0; y <= y1; y++) if (((x + y) & 1) == 0) u8g2.drawPixel(x, y);
+      } else if (shade == 1 && (x & 1) == 0) {
+        for (int y = y0; y <= y1; y += 2) u8g2.drawPixel(x, y);
+      }
+    }
+    if ((x & 3) == 0)
+      for (int y = ((y1 + 4) / 4) * 4; y < SH; y += 4) u8g2.drawPixel(x, y);
+  }
+}
+
+void drawSprites() {
+  int order[NEN]; float dd[NEN];
+  for (int i = 0; i < NEN; i++) {
+    order[i] = i;
+    float dx = en[i].x - posX, dy = en[i].y - posY;
+    dd[i] = dx * dx + dy * dy;
+  }
+  for (int i = 1; i < NEN; i++) {
+    int k = order[i]; int j = i - 1;
+    while (j >= 0 && dd[order[j]] < dd[k]) { order[j + 1] = order[j]; j--; }
+    order[j + 1] = k;
+  }
+  float inv = 1.0f / (planeX * dirY - dirX * planeY);
+  for (int n = 0; n < NEN; n++) {
+    Enemy &e = en[order[n]];
+    if (e.hp <= 0) continue;
+    float sx = e.x - posX, sy = e.y - posY;
+    float tx = inv * (dirY * sx - dirX * sy);
+    float ty = inv * (-planeY * sx + planeX * sy);
+    if (ty < 0.25f) continue;
+    int scx = (int)((SW / 2) * (1.0f + tx / ty));
+    int h = (int)(SH / ty); if (h > 200) h = 200;
+    int w = h / 2; if (w < 3) w = 3;
+    int left = scx - w / 2, right = scx + w / 2;
+    int top = SH / 2 - h / 4, bot = SH / 2 + h / 2;
+    int hh = bot - top;
+    for (int col = left; col <= right; col++) {
+      if (col < 0 || col >= SW) continue;
+      if (ty >= zbuf[col]) continue;
+      bool edge = (col <= left + 1) || (col >= right - 1);
+      for (int y = top; y <= bot; y++) {
+        if (y < 0 || y >= SH) continue;
+        bool eye = (hh > 12) && (y == top + hh / 5 || y == top + hh / 5 + 1) && (abs(col - scx) == w / 5);
+        bool lit = edge || (y < top + hh / 4) || (((col + y) & 1) == 0);
+        if (eye) lit = false;
+        u8g2.setDrawColor(lit ? 1 : 0);
+        u8g2.drawPixel(col, y);
+      }
+    }
+    u8g2.setDrawColor(1);
+  }
+}
+
+void fireGun() {
+  flash = 3;
+  playSound(SND_SHOT);
+  float inv = 1.0f / (planeX * dirY - dirX * planeY);
+  int best = -1; float bestTy = 1e9f;
+  for (int i = 0; i < NEN; i++) {
+    if (en[i].hp <= 0) continue;
+    float sx = en[i].x - posX, sy = en[i].y - posY;
+    float tx = inv * (dirY * sx - dirX * sy);
+    float ty = inv * (-planeY * sx + planeX * sy);
+    if (ty < 0.25f || fabsf(tx) > 0.3f) continue;
+    if (ty > zbuf[SW / 2]) continue;
+    if (ty < bestTy) { bestTy = ty; best = i; }
+  }
+  if (best >= 0) {
+    if (--en[best].hp <= 0) { kills++; playSound(SND_DIE); }
+    else playSound(SND_HIT);
+  }
+}
+
+void updateEnemies(float dt) {
+  for (int i = 0; i < NEN; i++) {
+    Enemy &e = en[i];
+    if (e.hp <= 0) continue;
+    float dx = posX - e.x, dy = posY - e.y;
+    float d = sqrtf(dx * dx + dy * dy);
+    if (d < 7.0f && d > 0.7f) {
+      float sp = 0.9f * dt;
+      moveEntity(e.x, e.y, dx / d * sp, dy / d * sp, 0.25f);
+    }
+    if (d < 0.9f && hurtCd <= 0) {
+      hp -= 10; hurtCd = 0.6f; hurtFlash = 2;
+      playSound(SND_HURT);
+    }
+  }
+}
+
+void drawHud() {
+  u8g2.setDrawColor(1);
+  u8g2.drawPixel(62, 32); u8g2.drawPixel(66, 32);
+  u8g2.drawPixel(64, 30); u8g2.drawPixel(64, 34);
+
+  u8g2.setDrawColor(0); u8g2.drawBox(54, 50, 20, 14);
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(62, 52, 4, 12);
+  u8g2.drawBox(58, 58, 12, 6);
+  if (flash > 0) {
+    u8g2.drawBox(61, 44, 6, 6);
+    u8g2.drawPixel(58, 47); u8g2.drawPixel(70, 47); u8g2.drawPixel(64, 41);
+  }
+
+  char s[24];
+  snprintf(s, sizeof(s), "HP %d  K %d/%d", hp < 0 ? 0 : hp, kills, NEN);
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(0, 7, s);
+
+  if (hurtFlash > 0) {
+    u8g2.setDrawColor(2); u8g2.drawBox(0, 0, SW, SH); u8g2.setDrawColor(1);
+    hurtFlash--;
+  }
+}
+
+// ================= เมนูและตัวควบคุมหลัก =================
+enum App { APP_MENU, APP_DOOM };
+App app = APP_MENU;
+int menuSel = 0;
+bool pFwd = true, pBack = true, pFire = true;
+
+void drawApple(int cx, int cy, int fg, int bg) {
+  u8g2.setDrawColor(fg);
+  u8g2.drawDisc(cx - 3, cy + 2, 5);
+  u8g2.drawDisc(cx + 3, cy + 2, 5);
+  u8g2.drawLine(cx, cy - 4, cx + 2, cy - 8);
+  u8g2.drawLine(cx + 1, cy - 6, cx + 5, cy - 7);
+  u8g2.drawLine(cx + 1, cy - 5, cx + 5, cy - 6);
+  u8g2.setDrawColor(bg);
+  u8g2.drawPixel(cx, cy - 2);
+  u8g2.drawPixel(cx, cy - 1);
+}
+
+void drawSkull(int cx, int cy, int fg, int bg) {
+  u8g2.setDrawColor(fg);
+  u8g2.drawRBox(cx - 8, cy - 9, 16, 12, 4);
+  u8g2.drawBox(cx - 5, cy + 2, 10, 6);
+  u8g2.setDrawColor(bg);
+  u8g2.drawDisc(cx - 3, cy - 3, 2);
+  u8g2.drawDisc(cx + 3, cy - 3, 2);
+  u8g2.drawPixel(cx, cy);
+  u8g2.drawVLine(cx - 2, cy + 4, 4);
+  u8g2.drawVLine(cx, cy + 4, 4);
+  u8g2.drawVLine(cx + 2, cy + 4, 4);
+}
+
+void drawMenu() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(0, 0, SW, 12);
+  u8g2.setDrawColor(0);
+  u8g2.setFont(u8g2_font_6x12_tr);
+  drawCentered("ESP32 ARCADE", 10);
+  if ((millis() / 400) & 1) {
+    u8g2.drawBox(3, 4, 3, 3);
+    u8g2.drawBox(SW - 6, 4, 3, 3);
+  }
+  for (int i = 0; i < 2; i++) {
+    int y = 14 + i * 25;
+    bool sel = (i == menuSel);
+    int fg = sel ? 0 : 1, bg = sel ? 1 : 0;
+    u8g2.setDrawColor(1);
+    if (sel) u8g2.drawBox(0, y, SW, 24); else u8g2.drawFrame(0, y, SW, 24);
+    if (i == 0) drawApple(15, y + 12, fg, bg); else drawSkull(15, y + 12, fg, bg);
+    u8g2.setDrawColor(fg);
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(32, y + 12, i == 0 ? "BAD APPLE" : "DOOM");
+    u8g2.setFont(u8g2_font_5x7_tr);
+    u8g2.drawStr(32, y + 21, i == 0 ? "VIDEO + AUDIO" : "FPS  RAYCASTER");
+    if (sel) {
+      int ax = 112 + ((millis() / 150) % 3) * 3;
+      u8g2.drawTriangle(ax, y + 8, ax, y + 16, ax + 5, y + 12);
+    }
+  }
+  u8g2.setDrawColor(1);
+  u8g2.sendBuffer();
+}
+
+void startDoom() {
+  resetGame();
+  app = APP_DOOM;
+  lastMs = millis();
+}
+
+void exitToMenu() {
+  stopMusic();
+  app = APP_MENU;
+  menuSel = 1;
+  waitRelease();
+  pFwd = pBack = pFire = true;
+}
+
+void runMenu() {
+  bool fwd = pressed(BTN_FWD), back = pressed(BTN_BACK), fire = pressed(BTN_FIRE);
+  if (fwd && !pFwd) menuSel = 0;
+  if (back && !pBack) menuSel = 1;
+  bool choose = fire && !pFire;
+  pFwd = fwd; pBack = back; pFire = fire;
+  drawMenu();
+  if (choose) {
+    playSound(SND_HIT);
+    u8g2.setDrawColor(2); u8g2.drawBox(0, 0, SW, SH); u8g2.sendBuffer();
+    u8g2.setDrawColor(1);
+    delay(120);
+    waitRelease();
+    if (menuSel == 0) { runBadApple(); pFwd = pBack = pFire = true; }
+    else startDoom();
+  }
+}
+
+void runDoom() {
+  uint32_t now = millis();
+  float dt = (now - lastMs) / 1000.0f; lastMs = now;
+  if (dt > 0.1f) dt = 0.1f;
+
+  bool fwd = pressed(BTN_FWD), back = pressed(BTN_BACK);
+  bool left = pressed(BTN_LEFT), right = pressed(BTN_RIGHT);
+  bool fire = pressed(BTN_FIRE);
+
+  if (state == PLAY) {
+    static float holdT = 0;
+    if (left && right) holdT += dt; else holdT = 0;
+    if (holdT > 1.0f) { holdT = 0; exitToMenu(); return; }
+
+    float ms = 2.2f * dt, rs = 2.0f * dt;
+    if (left)  rotateView(rs);
+    if (right) rotateView(-rs);
+    if (fwd)   moveEntity(posX, posY, dirX * ms, dirY * ms, 0.2f);
+    if (back)  moveEntity(posX, posY, -dirX * ms, -dirY * ms, 0.2f);
+    fireCd -= dt; hurtCd -= dt;
+    if (fire && fireCd <= 0) { fireGun(); fireCd = 0.3f; }
+    updateEnemies(dt);
+    if (hp <= 0)           { state = DEAD; musicCmd = 2; playSound(SND_LOSE); }
+    else if (kills >= NEN) { state = WON;  musicCmd = 2; playSound(SND_WIN); }
+  } else {
+    static bool wasFire = true, wasBack = true;
+    if (fire && !wasFire) { wasFire = fire; wasBack = back; resetGame(); }
+    else if (back && !wasBack) { wasFire = fire; wasBack = back; exitToMenu(); return; }
+    wasFire = fire; wasBack = back;
+  }
+
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  castWalls();
+  drawSprites();
+  drawHud();
+
+  if (state != PLAY) {
+    u8g2.setDrawColor(0); u8g2.drawBox(4, 16, 120, 32);
+    u8g2.setDrawColor(1); u8g2.drawFrame(4, 16, 120, 32);
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    drawCentered(state == DEAD ? "YOU DIED" : "CLEARED!", 33);
+    u8g2.setFont(u8g2_font_5x7_tr);
+    drawCentered("FIRE:RETRY  BACK:MENU", 43);
+  }
+  u8g2.sendBuffer();
+  if (flash > 0) flash--;
+}
+
+void setup() {
+  pinMode(BTN_FWD, INPUT_PULLUP);
+  pinMode(BTN_BACK, INPUT_PULLUP);
+  pinMode(BTN_LEFT, INPUT_PULLUP);
+  pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pinMode(BTN_FIRE, INPUT_PULLUP);
+  Serial.begin(115200);
+  sdOk = SD.begin(SD_CS);
+  setupAudio();
+  u8g2.setBusClock(800000);
+  u8g2.begin();
+}
+
+void loop() {
+  if (app == APP_MENU) runMenu(); else runDoom();
+}
