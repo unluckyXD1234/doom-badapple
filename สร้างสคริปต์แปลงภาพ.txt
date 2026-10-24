@@ -1,0 +1,30 @@
+import subprocess, sys
+import numpy as np
+
+SRC = sys.argv[1]
+FPS = 15
+W, H = 128, 64
+FRAME = W * H
+
+# ภาพต้นฉบับ 4:3 ย่อให้สูง 64 แล้วเติมขอบดำซ้ายขวาให้ครบ 128
+# ถ้าอยากให้เต็มจอแบบยืดภาพ ให้ใช้ f"fps={FPS},scale={W}:{H}:flags=area"
+vf = f"fps={FPS},scale=-2:{H}:flags=area,pad={W}:{H}:(ow-iw)/2:0:black"
+
+cmd = ["ffmpeg", "-v", "error", "-i", SRC, "-vf", vf,
+       "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+
+weights = (1 << np.arange(8)).reshape(1, 8, 1)
+n = 0
+with open("badapple.bin", "wb") as out:
+    while True:
+        buf = p.stdout.read(FRAME)
+        if len(buf) < FRAME:
+            break
+        img = np.frombuffer(buf, dtype=np.uint8).reshape(H, W) > 127
+        pages = img.reshape(8, 8, W)
+        data = (pages * weights).sum(axis=1).astype(np.uint8)
+        out.write(data.tobytes())
+        n += 1
+
+print(n, "frames written")
