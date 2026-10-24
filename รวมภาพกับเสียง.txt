@@ -1,0 +1,10 @@
+V = open("badapple.bin", "rb").read()
+A = open("audio15k.raw", "rb").read()
+n = len(V) // 1024
+with open("bad.dat", "wb") as o:
+    for i in range(n):
+        o.write(V[i*1024:(i+1)*1024])
+        a = A[i*1000:(i+1)*1000]
+        a += bytes([128]) * (1000 - len(a))   # เติมความเงียบถ้าเสียงสั้นกว่า
+        o.write(a)
+print(n, "frames")

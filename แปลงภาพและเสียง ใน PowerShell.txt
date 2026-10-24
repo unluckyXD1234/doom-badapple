@@ -1,0 +1,2 @@
+python convert.py badapple.mp4
+ffmpeg -i badapple.mp4 -vn -ac 1 -ar 15000 -f u8 audio15k.raw

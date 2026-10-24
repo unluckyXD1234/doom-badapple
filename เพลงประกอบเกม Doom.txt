@@ -1,0 +1,1 @@
+ffmpeg -i ชื่อเพลง.mp3 -ac 1 -ar 15000 -f u8 doom.raw
